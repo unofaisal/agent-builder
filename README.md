@@ -28,6 +28,14 @@ Add credential in the "Agent Setup" doctype
 ie provider [OPENROUTER, GEMINI, ANTHROPIC, GLM]
 and the API_KEY provided by your vendor
 
+## Desk Usage
+
+The Agent Builder chat widget icon is injected into the Frappe desk interface via JavaScript. For users to see the icon and access the chat widget:
+
+**Required Role:** Users must have the **"Omnis User"** role assigned to their account.
+
+The chat widget is injected into the desk interface on page load and will be hidden for users without this role. The role check is performed client-side in `agent_builder/public/js/chat_ui.bundle.js`.
+
 ## API Usage
 
 
