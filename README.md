@@ -68,7 +68,7 @@ This is the main runtime layer for chat, triggers, workflows, and tool execution
 
 ### API Layer (`agent_builder/api/`)
 
-- **`agent.py`** — Main chat endpoints using Hermes agent with Frappe tools
+- **`agent.py`** — Main chat endpoints using custom agent loop with Frappe tools
 - **`agent_test.py`** — Testing endpoint for quick agent invocation
 
 ### Agent tool ecosystem
