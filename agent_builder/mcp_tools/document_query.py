@@ -1,0 +1,557 @@
+# tools/frappe_tools/frappe_query.py
+
+import json
+import frappe
+from frappe.query_builder import Criterion, Order, Field
+from frappe.query_builder.functions import Sum, Count, Avg, Min, Max
+from frappe.desk.reportview import build_match_conditions
+
+try:
+	from pypika.terms import Criterion as _PypikaCriterion
+except Exception:  # pragma: no cover
+	_PypikaCriterion = None
+
+if _PypikaCriterion is not None:
+
+	class _RawCriterion(_PypikaCriterion):
+		"""A ready-made SQL condition (from build_match_conditions) usable in .where()."""
+
+		def __init__(self, sql):
+			super().__init__()
+			self._raw_sql = sql
+
+		def get_sql(self, **kwargs):
+			return self._raw_sql
+
+
+def _raw_condition(sql):
+	"""frappe.qb.raw() does not exist on newer Frappe. Fail closed: never skip a
+	row-level permission condition just because it can't be expressed."""
+	sql = f"({sql})"
+	raw = getattr(frappe.qb, "raw", None)
+	if callable(raw):
+		return raw(sql)
+	if _PypikaCriterion is None:
+		raise RuntimeError("Cannot apply row-level permissions: pypika is not importable")
+	return _RawCriterion(sql)
+
+from agent_builder.mcp_tools._common import (
+	ArgError,
+	coerce_int,
+	error_response,
+	loads_loose,
+	norm_args,
+	permitted_fieldnames,
+	resolve_doctype,
+)
+
+
+ALLOWED_JOIN_TYPES = {"left", "inner"}
+ALLOWED_AGG_FUNCTIONS = {"sum": Sum, "count": Count, "avg": Avg, "min": Min, "max": Max}
+MAX_JOINS = 3
+
+FILTER_OPERATORS = {
+	"=": lambda f, v: f == v,
+	"!=": lambda f, v: f != v,
+	">": lambda f, v: f > v,
+	"<": lambda f, v: f < v,
+	">=": lambda f, v: f >= v,
+	"<=": lambda f, v: f <= v,
+	"in": lambda f, v: f.isin(v),
+	"not_in": lambda f, v: f.notin(v),
+	"like": lambda f, v: f.like(f"%{v}%"),
+	"not_like": lambda f, v: f.not_like(f"%{v}%"),
+	"between": lambda f, v: f.between(v[0], v[1]),
+	"is_set": lambda f, v: f.isnotnull(),
+	"is_not_set": lambda f, v: f.isnull(),
+}
+
+_LIST_OPERATORS = {"in", "not_in"}
+_VALUE_REQUIRED = set(FILTER_OPERATORS) - {"is_set", "is_not_set"}
+
+MAX_LIMIT = 1000
+DEFAULT_LIMIT = 100
+
+
+class QueryBuildError(Exception):
+	"""Raised for any invalid operation, doctype, field, or permission failure."""
+	pass
+
+
+def frappe_query(args: dict, **kwargs) -> str:
+	"""Run a read-only multi-step query across linked doctypes, with optional
+	filtering, joins, and grouping/aggregation, using Frappe's native query builder."""
+	operations = None
+	try:
+		args = norm_args(args, kwargs)
+		operations = loads_loose(args.get("operations"))
+	except Exception:
+		pass
+
+	if not operations or not isinstance(operations, list):
+		return json.dumps({"error": "operations must be a non-empty list", "error_type": "invalid_argument"})
+
+	try:
+		builder = _QueryContext()
+		for idx, op in enumerate(operations):
+			op = loads_loose(op) or {}
+			if not isinstance(op, dict):
+				raise QueryBuildError(f"Operation {idx + 1}: must be an object")
+			op_type = op.get("type")
+			handler = builder.HANDLERS.get(op_type)
+
+			if handler is None:
+				raise QueryBuildError(
+					f"Operation {idx + 1}: unsupported type '{op_type}'. "
+					f"Allowed types: {sorted(builder.HANDLERS)}"
+				)
+
+			handler(builder, op)
+
+		rows = builder.execute()
+
+		return json.dumps({
+			"data": rows,
+			"count": len(rows),
+			"doctypes_used": builder.doctypes_used,
+			"warnings": builder.warnings,
+		}, default=str)
+
+	except QueryBuildError as e:
+		return json.dumps({"error": str(e), "error_type": "invalid_query"})
+	except Exception as e:
+		return json.dumps(
+			error_response(e, title="Frappe Query Tool Error", operations=json.dumps(operations, default=str)[:2000]),
+			default=str,
+		)
+
+
+class _QueryContext:
+	"""Walks the operations list in order and incrementally builds a
+	frappe.query_builder query, mirroring a linear pipeline (not a DAG)."""
+
+	STANDARD_FIELDS = frozenset({
+		"name", "creation", "modified", "owner", "modified_by", "docstatus",
+		"parent", "parenttype", "parentfield", "idx",
+	})
+
+	def __init__(self):
+		self.query = None
+		self.source_dt = None
+		self.source_tbl = None
+		self.tables = {}          # doctype -> qb table object
+		self.metas = {}           # doctype -> frappe Meta (cached, avoids repeat lookups)
+		self.doctypes_used = []
+		self.join_count = 0
+		self.group_by_fields = []
+		self.selected_aliases = set()   # every alias introduced via .as_() in select()
+		self.limit_value = DEFAULT_LIMIT
+		self.warnings = []
+		self.canon = {}                 # user-supplied doctype -> canonical name
+		self.permitted = {}             # doctype -> set of readable fieldnames | None
+		self.child_parent = {}          # child doctype -> parent doctype (for permlevel lookup)
+		self.has_source_select = False  # did select/summarize pick source columns?
+		self.summarized = False
+		self.plain_selects = []         # non-aggregated selected terms (need GROUP BY when summarizing)
+
+	# ---- helpers -----------------------------------------------------
+
+	def _canon(self, doctype):
+		if doctype not in self.canon:
+			resolved = resolve_doctype(doctype)
+			if not resolved:
+				raise QueryBuildError(f"Doctype '{doctype}' does not exist")
+			self.canon[doctype] = resolved
+		return self.canon[doctype]
+
+	def _get_meta(self, doctype):
+		doctype = self._canon(doctype)
+		if doctype not in self.metas:
+			self.metas[doctype] = frappe.get_meta(doctype)
+		return self.metas[doctype]
+
+	def _readable(self, doctype):
+		"""Fieldnames the user may read (permlevel-aware); None = unknown/unrestricted."""
+		if doctype not in self.permitted:
+			parent = self.child_parent.get(doctype)
+			perms = permitted_fieldnames(doctype, parenttype=parent)
+			self.permitted[doctype] = perms or None
+		return self.permitted[doctype]
+
+	def _check_field(self, doctype, fieldname):
+		doctype = self._canon(doctype)
+		if fieldname in self.STANDARD_FIELDS:
+			return
+		if not self._get_meta(doctype).has_field(fieldname):
+			raise QueryBuildError(f"Field '{fieldname}' does not exist on doctype '{doctype}'")
+		# Row-level conditions are re-applied below, but frappe.qb also bypasses
+		# field-level (permlevel) restrictions, so enforce those here.
+		readable = self._readable(doctype)
+		if readable is not None and fieldname not in readable:
+			raise frappe.PermissionError(f"No permission to read field '{fieldname}' on '{doctype}'")
+
+	def _get_table(self, doctype):
+		doctype = self._canon(doctype)
+		if doctype not in self.tables:
+			self._get_meta(doctype)  # existence check
+			if not frappe.has_permission(doctype, ptype="read"):
+				raise frappe.PermissionError(f"No permission to read '{doctype}'")
+			self.tables[doctype] = frappe.qb.DocType(doctype)
+			self.doctypes_used.append(doctype)
+		return self.tables[doctype]
+
+	def _row_permission_condition(self, doctype):
+		"""User-permission / permission-query-condition restrictions Frappe normally
+		applies automatically in get_list — frappe.qb bypasses these, so they're
+		added back in manually per doctype touched."""
+		match_conditions = build_match_conditions(doctype)
+		if match_conditions:
+			return _raw_condition(match_conditions)
+		return None
+
+	def _resolve_field(self, field_spec):
+		"""field_spec is either 'fieldname' (resolves against source doctype)
+		or 'Doctype.fieldname' (resolves against a joined doctype)."""
+		if "." in field_spec:
+			doctype, fieldname = field_spec.split(".", 1)
+			doctype = self._canon(doctype)
+			if doctype not in self.tables:
+				raise QueryBuildError(f"'{doctype}' has not been joined yet, cannot reference '{field_spec}'")
+		else:
+			doctype, fieldname = self.source_dt, field_spec
+		self._check_field(doctype, fieldname)
+		return getattr(self.tables[doctype], fieldname)
+
+	def _build_condition(self, filter_op):
+		field_spec = filter_op.get("field")
+		operator = filter_op.get("operator")
+		value = filter_op.get("value")
+
+		if not field_spec or operator not in FILTER_OPERATORS:
+			raise QueryBuildError(
+				f"Filter requires 'field' and a valid 'operator'. Allowed operators: {sorted(FILTER_OPERATORS)}"
+			)
+
+		if operator in _VALUE_REQUIRED and value is None:
+			raise QueryBuildError(f"Filter on '{field_spec}' with operator '{operator}' requires a 'value'")
+		if operator in _LIST_OPERATORS:
+			value = loads_loose(value)
+			if isinstance(value, str):
+				value = [v.strip() for v in value.split(",") if v.strip()]
+			if not isinstance(value, (list, tuple)) or not value:
+				raise QueryBuildError(f"Operator '{operator}' requires a non-empty list value")
+		if operator == "between":
+			value = loads_loose(value)
+			if not isinstance(value, (list, tuple)) or len(value) != 2:
+				raise QueryBuildError("Operator 'between' requires a value like [start, end]")
+
+		field = self._resolve_field(field_spec)
+		return FILTER_OPERATORS[operator](field, value)
+
+	# ---- operation handlers -------------------------------------------
+
+	def _apply_source(self, op):
+		if self.query is not None:
+			raise QueryBuildError("'source' must be the first operation")
+		doctype = op.get("doctype")
+		if not doctype:
+			raise QueryBuildError("'source' requires 'doctype'")
+		doctype = self._canon(doctype)
+		meta = self._get_meta(doctype)
+
+		if getattr(meta, "istable", 0):
+			self._setup_child_source(doctype)
+			return
+
+		self.source_dt = doctype
+		self.source_tbl = self._get_table(doctype)
+		self.query = frappe.qb.from_(self.source_tbl)
+		row_condition = self._row_permission_condition(doctype)
+		if row_condition is not None:
+			self.query = self.query.where(row_condition)
+
+	def _setup_child_source(self, doctype):
+		"""Child tables have no permission model of their own — access is entirely
+		inherited from whichever parent doctype(s) embed them. Resolve the parent(s)
+		automatically (no input needed from the model), check read permission on
+		each, and scope returned rows to only those belonging to a parent record
+		the user can actually read."""
+		parent_doctypes = frappe.get_all(
+			"DocField",
+			filters={"fieldtype": ["in", ["Table", "Table MultiSelect"]], "options": doctype},
+			pluck="parent",
+			distinct=True,
+		)
+		if not parent_doctypes:
+			raise QueryBuildError(
+				f"'{doctype}' is a child table with no doctype referencing it as a Table field — "
+				f"can't determine read permissions for it."
+			)
+
+		for parent_dt in parent_doctypes:
+			if not frappe.has_permission(parent_dt, ptype="read"):
+				raise frappe.PermissionError(
+					f"'{doctype}' rows belong to '{parent_dt}' records, which you don't have "
+					f"permission to read."
+				)
+
+		self.child_parent[doctype] = parent_doctypes[0]
+		self.source_dt = doctype
+		self.source_tbl = frappe.qb.DocType(doctype)
+		self.tables[doctype] = self.source_tbl
+		self.doctypes_used.append(doctype)
+		self.query = frappe.qb.from_(self.source_tbl)
+		allowed_subqueries = []
+		for parent_dt in parent_doctypes:
+			parent_tbl = frappe.qb.DocType(parent_dt)
+			sub = frappe.qb.from_(parent_tbl).select(parent_tbl.name)
+			row_condition = self._row_permission_condition(parent_dt)
+			if row_condition is not None:
+				sub = sub.where(row_condition)
+			allowed_subqueries.append(sub)
+
+		if len(allowed_subqueries) == 1:
+			self.query = self.query.where(self.source_tbl.parent.isin(allowed_subqueries[0]))
+		else:
+			# shared child table — a row is visible if its parent is permitted
+			# under ANY of the doctypes that use this child table
+			self.query = self.query.where(
+				Criterion.any(self.source_tbl.parent.isin(sub) for sub in allowed_subqueries)
+			)
+
+	def _require_source(self):
+		if self.query is None:
+			raise QueryBuildError("'source' must be the first operation")
+
+	def _apply_filter(self, op):
+		self._require_source()
+		self.query = self.query.where(self._build_condition(op))
+
+	def _apply_filter_group(self, op):
+		self._require_source()
+		logic = op.get("logic", "and")
+		filters = op.get("filters") or []
+		if not filters:
+			raise QueryBuildError("'filter_group' requires a non-empty 'filters' list")
+
+		conditions = [self._build_condition(f) for f in filters]
+		if logic == "and":
+			combined = Criterion.all(conditions)
+		elif logic == "or":
+			combined = Criterion.any(conditions)
+		else:
+			raise QueryBuildError("'filter_group' logic must be 'and' or 'or'")
+
+		self.query = self.query.where(combined)
+
+	def _apply_join(self, op):
+		self._require_source()
+		doctype = op.get("doctype")
+		join_type = op.get("join_type", "left")
+		left_field = op.get("left_field")
+		right_field = op.get("right_field")
+		select_fields = op.get("select") or []
+
+		if not doctype or not left_field or not right_field:
+			raise QueryBuildError("'join' requires 'doctype', 'left_field', and 'right_field'")
+		doctype = self._canon(doctype)
+		if join_type not in ALLOWED_JOIN_TYPES:
+			raise QueryBuildError(f"join_type must be one of {sorted(ALLOWED_JOIN_TYPES)}")
+		if doctype in self.tables:
+			raise QueryBuildError(f"'{doctype}' has already been joined — joining the same doctype twice isn't supported")
+		if self.join_count >= MAX_JOINS:
+			raise QueryBuildError(f"A single query supports at most {MAX_JOINS} joins")
+
+		self._check_field(self.source_dt, left_field)
+		self._check_field(doctype, right_field)
+		self._warn_if_not_a_real_link(doctype, left_field, right_field)
+
+		right_tbl = self._get_table(doctype)  # existence/permission-checked here
+		self.join_count += 1
+
+		left_col = getattr(self.source_tbl, left_field)
+		right_col = getattr(right_tbl, right_field)
+		condition = left_col == right_col
+
+		if join_type == "left":
+			self.query = self.query.left_join(right_tbl).on(condition)
+		else:
+			self.query = self.query.inner_join(right_tbl).on(condition)
+
+		row_condition = self._row_permission_condition(doctype)
+		if row_condition is not None:
+			self.query = self.query.where(row_condition)
+			if join_type == "left":
+				self.warnings.append(
+					f"You only have access to some '{doctype}' records, so this left join drops "
+					f"source rows whose '{doctype}' match is not visible to you (acts like an inner join)."
+				)
+
+		if isinstance(select_fields, str):
+			select_fields = [f.strip() for f in select_fields.split(",") if f.strip()]
+		for f in select_fields:
+			self._check_field(doctype, f)
+			alias = f"{doctype}.{f}"
+			if alias in self.selected_aliases:
+				raise QueryBuildError(f"'{alias}' has already been selected in this query")
+			term = getattr(right_tbl, f)
+			self.query = self.query.select(term.as_(alias))
+			self.selected_aliases.add(alias)
+			self.plain_selects.append(term)
+
+	def _warn_if_not_a_real_link(self, doctype, left_field, right_field):
+		"""left_field/right_field existing doesn't mean they're actually related —
+		flag joins that don't look like a real Link relationship so a nonsensical
+		join produces a visible warning instead of a silent empty/garbage result."""
+		source_meta = self._get_meta(self.source_dt)
+		field_def = source_meta.get_field(left_field)
+		if field_def is not None and field_def.fieldtype == "Link":
+			if field_def.options != doctype:
+				self.warnings.append(
+					f"'{self.source_dt}.{left_field}' is a Link to '{field_def.options}', not "
+					f"'{doctype}' — this join may not return meaningful matches."
+				)
+		elif right_field != "name":
+			self.warnings.append(
+				f"'{self.source_dt}.{left_field}' doesn't appear to be a Link field to '{doctype}' — "
+				f"double-check this join is between actually related records."
+			)
+
+	def _apply_select(self, op):
+		self._require_source()
+		fields = op.get("fields") or []
+		if isinstance(fields, str):
+			fields = [f.strip() for f in fields.split(",") if f.strip()]
+		if not fields:
+			raise QueryBuildError("'select' requires a non-empty 'fields' list")
+		for f in fields:
+			term = self._resolve_field(f)
+			if "." in f:
+				# Alias joined-doctype fields so they can't collide with a same-named source column.
+				if f in self.selected_aliases:
+					raise QueryBuildError(f"'{f}' has already been selected in this query")
+				self.query = self.query.select(term.as_(f))
+				self.selected_aliases.add(f)
+			else:
+				self.query = self.query.select(term)
+				self.has_source_select = True
+			self.plain_selects.append(term)
+
+	def _apply_summarize(self, op):
+		self._require_source()
+		group_by = op.get("group_by") or []
+		measures = loads_loose(op.get("measures")) or []
+		if isinstance(group_by, str):
+			group_by = [g.strip() for g in group_by.split(",") if g.strip()]
+		if isinstance(measures, dict):
+			measures = [measures]
+
+		if not group_by and not measures:
+			raise QueryBuildError("'summarize' requires 'group_by' and/or 'measures'")
+
+		self.summarized = True
+		self.has_source_select = True
+
+		for f in group_by:
+			field = self._resolve_field(f)
+			self.query = self.query.select(field).groupby(field)
+			self.group_by_fields.append(f)
+
+		for m in measures:
+			if not isinstance(m, dict):
+				raise QueryBuildError("Each measure must be an object with 'function' and 'field'")
+			field_spec = m.get("field")
+			fn_name = m.get("function")
+			if not field_spec:
+				if fn_name == "count":
+					field_spec = "name"
+				else:
+					raise QueryBuildError("Each measure requires a 'field'")
+			alias = m.get("as") or f"{fn_name}_{field_spec}".replace(".", "_")
+
+			if fn_name not in ALLOWED_AGG_FUNCTIONS:
+				raise QueryBuildError(f"Aggregate function must be one of {sorted(ALLOWED_AGG_FUNCTIONS)}")
+			if alias in self.selected_aliases:
+				raise QueryBuildError(
+					f"Measure alias '{alias}' is already used by another measure or joined field "
+					f"in this query — give it a distinct 'as' name."
+				)
+
+			field = self._resolve_field(field_spec)
+			agg_fn = ALLOWED_AGG_FUNCTIONS[fn_name]
+			self.query = self.query.select(agg_fn(field).as_(alias))
+			self.selected_aliases.add(alias)
+
+	def _apply_order_by(self, op):
+		self._require_source()
+		field_spec = op.get("field")
+		direction = op.get("direction", "asc")
+		if not field_spec:
+			raise QueryBuildError("'order_by' requires 'field'")
+
+		direction = str(direction).lower()
+		if direction not in ("asc", "desc"):
+			raise QueryBuildError("'order_by' direction must be 'asc' or 'desc'")
+		order = Order.asc if direction == "asc" else Order.desc
+
+		# If field_spec is a SELECT alias (e.g. a 'summarize' measure alias, or an
+		# aliased joined field), it isn't a real column and _resolve_field would
+		# either raise or — worse — silently resolve to an unrelated real column.
+		# pypika only renders a bare alias in ORDER BY when the Field object passed
+		# in has .alias set AND that alias is present in the query's SELECT list
+		# (see pypika QueryBuilder._orderby_sql). Passing a raw string instead gets
+		# implicitly re-wrapped as Field(field_spec, table=<from-table>), which is
+		# exactly what produced "Unknown column 'tab<Source>.<alias>' in 'ORDER BY'".
+		if field_spec in self.selected_aliases:
+			alias_field = Field(field_spec).as_(field_spec)
+			self.query = self.query.orderby(alias_field, order=order)
+			return
+
+		field = self._resolve_field(field_spec)
+		self.query = self.query.orderby(field, order=order)
+
+	def _apply_limit(self, op):
+		self._require_source()
+		value = op.get("value", DEFAULT_LIMIT)
+		if isinstance(value, bool):
+			raise QueryBuildError("'limit' value must be a positive integer")
+		value = coerce_int(value, 0)
+		if value < 1:
+			raise QueryBuildError("'limit' value must be a positive integer")
+		self.limit_value = min(value, MAX_LIMIT)
+
+	# ---- execution ------------------------------------------------------
+
+	def execute(self):
+		self._require_source()
+
+		# Without this, a query with no select/summarize renders as an empty SELECT and fails.
+		if not self.has_source_select:
+			default_cols = ["name", "parent", "parenttype", "idx"] if self._is_child_source() else [
+				"name", "creation", "modified"
+			]
+			for col in default_cols:
+				self.query = self.query.select(getattr(self.source_tbl, col))
+
+		# Strict SQL modes reject selected columns that are neither grouped nor aggregated.
+		if self.summarized and self.plain_selects:
+			for term in self.plain_selects:
+				self.query = self.query.groupby(term)
+
+		self.query = self.query.limit(self.limit_value)
+		result = self.query.run(as_dict=True)
+		return result
+
+	def _is_child_source(self):
+		return bool(getattr(self._get_meta(self.source_dt), "istable", 0))
+
+	HANDLERS = {
+		"source": _apply_source,
+		"filter": _apply_filter,
+		"filter_group": _apply_filter_group,
+		"join": _apply_join,
+		"select": _apply_select,
+		"summarize": _apply_summarize,
+		"order_by": _apply_order_by,
+		"limit": _apply_limit,
+	}

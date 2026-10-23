@@ -271,3 +271,6 @@ app_include_js = [
     # "/assets/agent_builder/js/agent_notifications.js"
 ]
 app_include_css = ["/assets/agent_builder/css/Chat_Ui.bundle.css"]
+
+# agent_builder/hooks.py
+before_request = ["agent_builder.oauth_url_fix.patch_oauth_urls"]
